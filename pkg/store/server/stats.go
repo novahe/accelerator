@@ -11,22 +11,32 @@ import (
 // request handlers (one Add per request); read a consistent window with
 // Snapshot. Counters are cumulative — the printer diffs successive snapshots.
 type Stats struct {
-	getN     atomic.Uint64 // Get attempts
-	getHits  atomic.Uint64 // Get attempts that found the key
-	getBytes atomic.Uint64 // bytes streamed OUT on Get hits
-	putN     atomic.Uint64 // Put attempts
-	putBytes atomic.Uint64 // bytes received + stored on Put (excludes dedup hits)
-	putDedup atomic.Uint64 // Put that short-circuited on an existing key (no store)
-	admitN   atomic.Uint64 // AdmitWrite calls
-	errN     atomic.Uint64 // requests that returned a gRPC error
-	inflight atomic.Int64  // gauge: Get+Put currently executing
+	getN                  atomic.Uint64 // Get attempts
+	getHits               atomic.Uint64 // Get attempts that found the key
+	getBytes              atomic.Uint64 // bytes streamed OUT on Get hits
+	putN                  atomic.Uint64 // Put attempts
+	putBytes              atomic.Uint64 // bytes received + stored on Put (excludes dedup hits)
+	chunkPutRequests      atomic.Uint64
+	chunkDedup            atomic.Uint64
+	chunkCacheIntercepted atomic.Uint64
+	putDedup              atomic.Uint64 // Put that short-circuited on an existing key (no store)
+	admitN                atomic.Uint64 // AdmitWrite calls
+	errN                  atomic.Uint64 // requests that returned a gRPC error
+	inflight              atomic.Int64  // gauge: Get+Put currently executing
 
 	getHist obstat.Hist // Get wall-clock latency
 	putHist obstat.Hist // Put wall-clock latency
 }
 
 // StatsSnapshot is an immutable read of Stats.
+type ChunkStats struct {
+	PutRequestsTotal      uint64 `json:"put_requests_total"`
+	DedupTotal            uint64 `json:"dedup_total"`
+	CacheInterceptedTotal uint64 `json:"cache_intercepted_total"`
+}
+
 type StatsSnapshot struct {
+	Chunk                    ChunkStats
 	GetN, GetHits, GetBytes  uint64
 	PutN, PutBytes, PutDedup uint64
 	AdmitN, ErrN             uint64
@@ -36,8 +46,14 @@ type StatsSnapshot struct {
 
 // Snapshot reads the counters. Safe to call concurrently with request handling.
 func (s *Stats) Snapshot() StatsSnapshot {
+	// Read subset counters before their supersets. Concurrent completions must
+	// not make the displayed cache rate exceed dedup, or dedup exceed 100%.
+	chunk := ChunkStats{CacheInterceptedTotal: s.chunkCacheIntercepted.Load()}
+	chunk.DedupTotal = s.chunkDedup.Load()
+	chunk.PutRequestsTotal = s.chunkPutRequests.Load()
 	return StatsSnapshot{
-		GetN: s.getN.Load(), GetHits: s.getHits.Load(), GetBytes: s.getBytes.Load(),
+		Chunk: chunk,
+		GetN:  s.getN.Load(), GetHits: s.getHits.Load(), GetBytes: s.getBytes.Load(),
 		PutN: s.putN.Load(), PutBytes: s.putBytes.Load(), PutDedup: s.putDedup.Load(),
 		AdmitN: s.admitN.Load(), ErrN: s.errN.Load(),
 		Inflight: s.inflight.Load(),

@@ -364,7 +364,8 @@ Server 不会在 rollout 时发现应用侧的有效引用或迁移对象。
 ```
 
 PutHandle 在内存中有界缓冲并以单次 PutObject 写入固定 key。`max_inflight` 限制
-并发 S3 调用；`op_timeout` 为空时只受调用方 context 控制；
+并发 S3 调用；缓存关闭时，`op_timeout` 为空仍只受调用方 context 控制；
+缓存开启时默认 10s 且必须为正，chunk 的 Exists/Commit 各共享一份覆盖 gate、S3 排队和远端调用的预算；
 `max_object_size_bytes` 限制单对象大小。generation source 的 S3 endpoint、bucket、
 key 和凭据可与数据 backend 完全不同。
 
@@ -486,3 +487,40 @@ helper 成功后,调用方拥有从 FD 3 开始的原始 Files,须关闭它们;h
 - 仓库根目录 `README.md` / `Makefile` — 构建和完整测试入口
 
 Store 单次读取与非重放边界见[§3.1](#31-单次读取与写入边界).
+
+## S3 chunk 元数据缓存
+
+S3 服务默认开启 `s3.chunk_metadata_cache`：目录
+`/run/store-ctl/chunk-metadata-cache`、max_ttl `168h`、最多 `150000` 条。
+目录自动创建并要求实际位于 tmpfs。配置中可覆盖默认值，显式 `enabled: false` 关闭。
+它缓存已存在 chunk 的路径元信息，不缓存正文；命中不续期，重启重载未过期记录。
+达到软刷新时间但尚未硬过期的命中可入队验证，固定一个 worker，默认最多每秒发起 2 次 SDK HEAD；未访问不主动验证。
+`refresh_ahead.enabled: false` 关闭验证，`refresh_ahead.max_qps` 覆盖其速率。
+
+指标默认每 5 秒原子发布到 `/run/store-ctl/chunk-metadata-cache-stats.json`，可直接 cat。
+历史累计 Counter 在同一存储身份下接续；异常退出可能丢失未发布增量，机器重启会清空 tmpfs。
+`stats_file: ""` 关闭文件指标，`stats_file_interval` 覆盖发布周期，独立于日志 stats_interval。
+FS 后端仍默认不启用这些 tmpfs 功能。
+
+```yaml
+s3:
+  # 保留已有 S3 字段；下面各项均可省略以采用默认值。
+  chunk_metadata_cache:
+    enabled: true
+    dir: /run/store-ctl/chunk-metadata-cache
+    max_ttl: 168h
+    max_entries: 150000
+    refresh_ahead:
+      enabled: true
+      max_qps: 2
+stats_file: /run/store-ctl/chunk-metadata-cache-stats.json
+stats_file_interval: 5s
+```
+
+服务管理器需保留 runtime 目录，随附 unit 已配置 RuntimeDirectoryPreserve=yes。
+TTL 内外部直接删除/覆盖 S3 对象可能留下陈旧 positive；要求每次提交重验远端存在性时关闭缓存。
+详见 [完整设计与验证](store-chunk-metadata-cache-design_zh.md)。
+
+JSON 直接输出 `chunk.dedup_rate_percent`（总去重率）和 `chunk.cache_intercept_rate_percent`（缓存拦截率），按累计提交数计算，最多两位小数；无请求时为 null。
+
+`fills_dropped_total` 统计清理积压或 SIEVE 扫描预算耗尽导致的填充跳过。显式 stats_file 的父目录必须位于 tmpfs，FS 后端也一样。

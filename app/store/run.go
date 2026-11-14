@@ -80,16 +80,35 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 		err = ctx.Err()
 		return startupError(ctx, errors.Join(err, closeSource()))
 	}
-	backend, closeBackend, err := openBackend(ctx, cfg, opts.ObjectCredentials)
+	backend, closeBackend, err := openBackend(ctx, cfg, opts.ObjectCredentials, log)
 	if err != nil {
 		return startupError(ctx, errors.Join(err, closeSource()))
 	}
-	closeOwned := func() error { life.Close(); return errors.Join(closeBackend(), closeSource()) }
+	var stats *statsFile
+	s3Backend, _ := backend.(*stores3.Store)
+	closeOwned := func() error {
+		life.Close()
+		if s3Backend != nil {
+			s3Backend.StopBackground()
+		}
+		if stats != nil {
+			stats.close()
+		}
+		return errors.Join(closeBackend(), closeSource())
+	}
+	if s3Backend != nil {
+		s3Backend.UpdateGenerations(input.view())
+		input.onPublish = s3Backend.UpdateGenerations
+	}
 	if !life.Active(nil) {
 		err = ctx.Err()
 		return startupError(ctx, errors.Join(err, closeOwned()))
 	}
 	srv, err := storeserver.New(storeserver.Options{Backend: backend, Generations: input.view, VerifyKey: cfg.VerifyKey()})
+	if err != nil {
+		return startupError(ctx, errors.Join(err, closeOwned()))
+	}
+	stats, err = newStatsFile(cfg, backend, srv, log)
 	if err != nil {
 		return startupError(ctx, errors.Join(err, closeOwned()))
 	}
@@ -149,6 +168,10 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 	}
 	if !life.Active(func() {
 		observers.Add(2)
+		if stats != nil {
+			observers.Add(1)
+			go func() { defer observers.Done(); stats.run(runCtx) }()
+		}
 		go func() { defer observers.Done(); input.run(runCtx, opts.Reload, log) }()
 		go func() {
 			defer observers.Done()
@@ -157,6 +180,10 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 		go func() { results <- result{"grpc", gs.Serve(gl)} }()
 		if ws != nil {
 			go func() { results <- result{"cache", ws.Serve(wl)} }()
+		}
+		if s3Backend != nil {
+			m := s3Backend.MetadataCacheStats()
+			log.Info("chunk metadata cache", "enabled", m.Enabled, "state", m.State, "dir", cfg.S3.ChunkMetadataCache.Dir, "max_ttl_seconds", m.MaxTTLSeconds, "max_entries", m.MaxEntries, "entries", m.Entries, "reloaded_entries", m.ReloadedEntries, "stats_file", *cfg.StatsFile)
 		}
 		snap := input.current()
 		log.Info("store started", "listen", cfg.Listen, "backend", cfg.Backend, "generation", snap[len(snap)-1], "verify", cfg.VerifyKey(), "direct_io", cfg.Backend == "fs" && cfg.FS.DirectIO)
@@ -262,7 +289,7 @@ func canceledLeaves(err error) bool {
 	return err == context.Canceled
 }
 
-func openBackend(ctx context.Context, cfg Config, credentials CredentialsProvider) (storeserver.Backend, func() error, error) {
+func openBackend(ctx context.Context, cfg Config, credentials CredentialsProvider, log *slog.Logger) (storeserver.Backend, func() error, error) {
 	if cfg.Backend == "fs" {
 		b, err := storefs.New(storefs.Config{Root: cfg.FS.Root, DirectIO: cfg.FS.DirectIO})
 		return b, nopClose, err
@@ -272,11 +299,19 @@ func openBackend(ctx context.Context, cfg Config, credentials CredentialsProvide
 		return nil, nopClose, err
 	}
 	timeout, _ := cfg.S3OpTimeout()
-	b, err := stores3.New(ctx, c, stores3.Config{Bucket: cfg.S3.Bucket, Prefix: cfg.S3.Prefix, MaxInflight: cfg.S3.MaxInflight, OpTimeout: timeout, MaxObjectSize: cfg.S3.MaxObjectSize})
+	backendConfig := stores3.Config{Bucket: cfg.S3.Bucket, Prefix: cfg.S3.Prefix, MaxInflight: cfg.S3.MaxInflight, OpTimeout: timeout, MaxObjectSize: cfg.S3.MaxObjectSize}
+	if m := cfg.S3.ChunkMetadataCache; m.IsEnabled() {
+		ttl, _ := time.ParseDuration(m.MaxTTL)
+		backendConfig.ChunkMetadataCache = &stores3.ChunkMetadataCacheConfig{Dir: m.Dir, MaxTTL: ttl, MaxEntries: *m.MaxEntries, Logger: log, Namespace: cfg.S3CacheNamespace()}
+		if m.RefreshAhead.IsEnabled() {
+			backendConfig.ChunkMetadataCache.RefreshAhead = &stores3.ChunkRefreshConfig{MaxQPS: *m.RefreshAhead.MaxQPS}
+		}
+	}
+	b, err := stores3.New(ctx, c, backendConfig)
 	if err != nil {
 		return nil, nopClose, errors.Join(err, c.Close())
 	}
-	return b, c.Close, nil
+	return b, func() error { return errors.Join(b.Close(), c.Close()) }, nil
 }
 func nopClose() error { return nil }
 

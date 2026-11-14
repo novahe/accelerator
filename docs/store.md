@@ -312,7 +312,7 @@ The object layout matches FS:
 <prefix>/<partition>/<generation>/<aa>/<bb>/<content-key>
 ```
 
-PutHandle buffers within a memory bound and writes the fixed key with one PutObject. `max_inflight` limits concurrent S3 calls; an empty `op_timeout` leaves timeout control solely to the caller's context; `max_object_size_bytes` limits object size. The generation source may use an entirely different S3 endpoint, bucket, key and credentials from the data backend.
+PutHandle buffers within a memory bound and writes the fixed key with one PutObject. `max_inflight` limits concurrent S3 calls; with caching disabled, an empty `op_timeout` leaves timeout control solely to the caller's context; with caching enabled it defaults to 10s, must be positive, and each chunk Exists/Commit shares one budget across gate/semaphore waits and remote calls; `max_object_size_bytes` limits object size. The generation source may use an entirely different S3 endpoint, bucket, key and credentials from the data backend.
 
 <a id="8-cache_listen-与运维"></a>
 ## 8. `cache_listen` and operations
@@ -428,3 +428,32 @@ On helper success, the caller owns the original Files starting at FD 3 and must 
 - Repository-root `README.md` / `Makefile`: build and full-test entry points.
 
 Store read-attempt and non-replay boundaries are specified in [§3.1](#31-read-attempt-and-write-boundary).
+
+## S3 chunk metadata cache
+
+S3 services enable `s3.chunk_metadata_cache` by default: tmpfs directory
+`/run/store-ctl/chunk-metadata-cache`, max_ttl `168h`, maximum `150000` entries.
+Directories are created automatically. Configuration overrides defaults;
+`enabled: false` disables the cache. FS backends do not enable it.
+Only positive chunk path metadata is cached, never object bodies. Hits do not
+renew TTL on their own. After the soft deadline, a hit queues verification to
+one worker (default maximum 2 SDK HEAD calls/second). Unaccessed entries are not
+proactively verified. `refresh_ahead.enabled: false` disables verification;
+`refresh_ahead.max_qps` overrides its rate. Unexpired, validated records reload
+across process restarts.
+
+The service atomically publishes JSON counters every 5 seconds to
+`/run/store-ctl/chunk-metadata-cache-stats.json`; read it with `cat`.
+`stats_file` overrides this path (empty disables it), and `stats_file_interval`
+overrides the period independently of the existing logging interval.
+Published cumulative counters resume for the same storage identity. Crashes can
+lose unpublished increments; rebooting or unmounting tmpfs loses its files.
+The supplied systemd unit preserves the runtime directory across service stops.
+
+Out-of-band S3 deletion/overwrite can leave stale positive entries until expiry.
+Disable the cache if every submission must revalidate remote existence. See the
+[design and validation](store-chunk-metadata-cache-design.md).
+
+JSON includes `chunk.dedup_rate_percent` and `chunk.cache_intercept_rate_percent`, derived from cumulative submissions and rounded to two decimal places; both are null before any submissions.
+
+`fills_dropped_total` counts fills skipped due to pending cleanup or the SIEVE scan budget. An explicit stats_file requires a tmpfs parent directory, including for FS backends.

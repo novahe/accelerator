@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/kuasar-sandbox/accelerator/internal/util/chunkmeta"
 )
 
 // defaultStatsInterval is the base period for the adaptive stats line when
@@ -56,6 +58,10 @@ type Config struct {
 	// daemon prints to stderr (silent when there was no traffic in the
 	// window). Empty/absent → 30s (on by default); "0"/"off" disables it.
 	StatsInterval string `yaml:"stats_interval"`
+
+	// StatsFile is a tmpfs JSON snapshot. Nil selects the S3 default; empty disables it.
+	StatsFile         *string `yaml:"stats_file,omitempty"`
+	StatsFileInterval string  `yaml:"stats_file_interval,omitempty"`
 
 	// CacheListen, when non-empty, starts an embedded read-only cache wire
 	// server on this address (TCP, UDS, or fd=<name>) alongside the store
@@ -233,7 +239,68 @@ func (c *GenerationS3Config) PathStyleEnabled() bool {
 // S3Config is the S3-compatible backend's parameter set. String fields
 // support `${VAR}` shell-style env-var expansion so the yaml can be
 // committed without secrets.
+// ChunkMetadataCacheConfig overrides the S3 service defaults. A nil Enabled
+// means enabled; a nil MaxEntries selects 150000. Explicit false disables it.
+type ChunkMetadataCacheConfig struct {
+	Enabled      *bool               `yaml:"enabled,omitempty"`
+	Dir          string              `yaml:"dir,omitempty"`
+	MaxTTL       string              `yaml:"max_ttl,omitempty"`
+	MaxEntries   *int                `yaml:"max_entries,omitempty"`
+	RefreshAhead *ChunkRefreshConfig `yaml:"refresh_ahead,omitempty"`
+}
+
+type ChunkRefreshConfig struct {
+	Enabled *bool    `yaml:"enabled,omitempty"`
+	MaxQPS  *float64 `yaml:"max_qps,omitempty"`
+}
+
+func (c *ChunkRefreshConfig) IsEnabled() bool { return c != nil && (c.Enabled == nil || *c.Enabled) }
+
+// Reject misspelled cache options rather than silently using a default.
+func cacheMapping(node *yaml.Node, fields ...string) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("store-ctl: cache options must be a mapping")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		found := false
+		for _, name := range fields {
+			if node.Content[i].Value == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("store-ctl: unknown chunk_metadata_cache option %q", node.Content[i].Value)
+		}
+	}
+	return nil
+}
+func (c *ChunkMetadataCacheConfig) UnmarshalYAML(node *yaml.Node) error {
+	if err := cacheMapping(node, "enabled", "dir", "max_ttl", "max_entries", "refresh_ahead"); err != nil {
+		return err
+	}
+	type plain ChunkMetadataCacheConfig
+	return node.Decode((*plain)(c))
+}
+func (c *ChunkRefreshConfig) UnmarshalYAML(node *yaml.Node) error {
+	if err := cacheMapping(node, "enabled", "max_qps"); err != nil {
+		return err
+	}
+	type plain ChunkRefreshConfig
+	return node.Decode((*plain)(c))
+}
+
+const DefaultChunkMetadataCacheDir = "/run/store-ctl/chunk-metadata-cache"
+const DefaultStatsFile = "/run/store-ctl/chunk-metadata-cache-stats.json"
+const DefaultChunkMetadataCacheEntries = 150000
+
+func (c *ChunkMetadataCacheConfig) IsEnabled() bool {
+	return c != nil && (c.Enabled == nil || *c.Enabled)
+}
+
 type S3Config struct {
+	ChunkMetadataCache *ChunkMetadataCacheConfig `yaml:"chunk_metadata_cache,omitempty"`
+
 	// Endpoint is the S3-compatible endpoint URL. Required.
 	Endpoint string `yaml:"endpoint"`
 
@@ -262,8 +329,10 @@ type S3Config struct {
 	// MaxInflight bounds concurrent S3 calls. Default 64.
 	MaxInflight int `yaml:"max_inflight"`
 
-	// OpTimeout is the per-call wall-clock budget (Go duration
-	// string, e.g. "10s"). Empty/absent = 0 = no per-op deadline.
+	// OpTimeout is the remote-call budget. With chunk metadata caching,
+	// it defaults to 10s, must be positive, and also bounds the entire
+	// keyed Exists/Commit stage (gate, S3 semaphore, HEAD and optional PUT).
+	// Without caching, omitted preserves the legacy unbounded default.
 	OpTimeout string `yaml:"op_timeout"`
 
 	// MaxObjectSize bounds Get response bytes. Default 16 MiB.
@@ -398,10 +467,32 @@ func (c Config) Clone() Config {
 		copy.PathStyle = cloneBool(value.PathStyle)
 		copy.VerifyContentKey = cloneBool(value.VerifyContentKey)
 		copy.TLS = cloneTLS(value.TLS)
+		if value.ChunkMetadataCache != nil {
+			meta := *value.ChunkMetadataCache
+			meta.Enabled = cloneBool(meta.Enabled)
+			if meta.MaxEntries != nil {
+				n := *meta.MaxEntries
+				meta.MaxEntries = &n
+			}
+			if meta.RefreshAhead != nil {
+				r := *meta.RefreshAhead
+				r.Enabled = cloneBool(r.Enabled)
+				if r.MaxQPS != nil {
+					q := *r.MaxQPS
+					r.MaxQPS = &q
+				}
+				meta.RefreshAhead = &r
+			}
+			copy.ChunkMetadataCache = &meta
+		}
 		return &copy
 	}
 
 	copy := c
+	if c.StatsFile != nil {
+		value := *c.StatsFile
+		copy.StatsFile = &value
+	}
 	if c.FS != nil {
 		fs := *c.FS
 		fs.VerifyContentKey = cloneBool(c.FS.VerifyContentKey)
@@ -474,6 +565,9 @@ func (c *Config) normalizeSelected(requireListen, expandEnvironment, generations
 		if err := c.S3.TLS.validate("s3.tls"); err != nil {
 			return err
 		}
+	}
+	if err := c.normalizeMetadataCache(expandEnvironment); err != nil {
+		return err
 	}
 	if generations {
 		return c.normaliseGenerations(expandEnvironment, generationStatic)
@@ -614,13 +708,107 @@ func (c *Config) S3PathStyle() bool {
 	return *c.S3.PathStyle
 }
 
-// S3OpTimeout returns the parsed S3 op-timeout. Empty/absent = 0 =
-// no per-op deadline: an S3 op is bounded only by the caller's
-// context, never an arbitrary number. Operators opt into a finite
-// budget by setting s3.op_timeout explicitly.
+// S3OpTimeout returns the normalized S3 timeout. With chunk metadata caching,
+// omitted defaults to 10s and each keyed Exists/Commit shares that budget across
+// queuing and remote work. Without caching, omitted preserves the legacy zero.
 func (c *Config) S3OpTimeout() (time.Duration, error) {
 	if c.S3.OpTimeout == "" {
 		return 0, nil
 	}
 	return time.ParseDuration(c.S3.OpTimeout)
+}
+
+// normalizeMetadataCache performs no filesystem I/O, including for admin commands.
+func (c *Config) normalizeMetadataCache(expandEnvironment bool) error {
+	if c.StatsFile == nil {
+		value := ""
+		if c.Backend == "s3" {
+			value = DefaultStatsFile
+		}
+		c.StatsFile = &value
+	}
+	if expandEnvironment {
+		value := expandEnv(*c.StatsFile)
+		c.StatsFile = &value
+	}
+	if *c.StatsFile != "" {
+		if !filepath.IsAbs(*c.StatsFile) {
+			return fmt.Errorf("store-ctl: stats_file must be absolute")
+		}
+		if c.StatsFileInterval == "" {
+			c.StatsFileInterval = "5s"
+		}
+		d, err := time.ParseDuration(c.StatsFileInterval)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("store-ctl: invalid stats_file_interval %q", c.StatsFileInterval)
+		}
+	}
+	if c.Backend != "s3" {
+		return nil
+	}
+	if c.S3.ChunkMetadataCache == nil {
+		c.S3.ChunkMetadataCache = &ChunkMetadataCacheConfig{}
+	}
+	m := c.S3.ChunkMetadataCache
+	if m.Enabled == nil {
+		enabled := true
+		m.Enabled = &enabled
+	}
+	if m.Dir == "" {
+		m.Dir = DefaultChunkMetadataCacheDir
+	}
+	if expandEnvironment {
+		m.Dir = expandEnv(m.Dir)
+	}
+	if m.MaxTTL == "" {
+		m.MaxTTL = "168h"
+	}
+	if m.MaxEntries == nil {
+		n := DefaultChunkMetadataCacheEntries
+		m.MaxEntries = &n
+	}
+	if m.RefreshAhead == nil {
+		m.RefreshAhead = &ChunkRefreshConfig{}
+	}
+	r := m.RefreshAhead
+	if r.Enabled == nil {
+		enabled := true
+		r.Enabled = &enabled
+	}
+	if r.MaxQPS == nil {
+		q := 2.0
+		r.MaxQPS = &q
+	}
+	if !m.IsEnabled() {
+		return nil
+	}
+	if r.IsEnabled() {
+		if _, err := chunkmeta.RefreshInterval(*r.MaxQPS); err != nil {
+			return fmt.Errorf("store-ctl: invalid s3.chunk_metadata_cache.refresh_ahead.max_qps")
+		}
+	}
+	if c.S3.OpTimeout == "" {
+		c.S3.OpTimeout = "10s"
+	}
+	budget, err := time.ParseDuration(c.S3.OpTimeout)
+	if err != nil || budget <= 0 {
+		return fmt.Errorf("store-ctl: s3.op_timeout must be positive when chunk_metadata_cache is enabled")
+	}
+	if !filepath.IsAbs(m.Dir) {
+		return fmt.Errorf("store-ctl: s3.chunk_metadata_cache.dir must be absolute")
+	}
+	d, err := time.ParseDuration(m.MaxTTL)
+	if err != nil || d <= 0 {
+		return fmt.Errorf("store-ctl: invalid s3.chunk_metadata_cache.max_ttl %q", m.MaxTTL)
+	}
+	if *m.MaxEntries <= 0 {
+		return fmt.Errorf("store-ctl: s3.chunk_metadata_cache.max_entries must be positive")
+	}
+	return nil
+}
+
+// S3CacheNamespace binds cache records and metrics to the same normalized
+// storage configuration used by serving and offline purge.
+func (c *Config) S3CacheNamespace() string {
+	return chunkmeta.Namespace(c.S3.Endpoint, c.S3.Region, c.S3.Bucket, c.S3.Prefix, c.S3PathStyle())
 }

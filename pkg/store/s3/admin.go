@@ -13,6 +13,11 @@ func (s *Store) DropGeneration(ctx context.Context, generation store.Generation)
 	if err := store.ValidateGeneration(generation); err != nil {
 		return fmt.Errorf("s3: %w", err)
 	}
+	if s.metadata != nil {
+		if err := s.metadata.invalidate(&generation); err != nil {
+			return err
+		}
+	}
 	for _, partition := range s3Partitions() {
 		prefix := path.Join(s.prefix, string(partition), string(generation)) + "/"
 		if err := s.deleteUnder(ctx, prefix); err != nil {
@@ -24,6 +29,11 @@ func (s *Store) DropGeneration(ctx context.Context, generation store.Generation)
 
 // Wipe deletes object partitions only and never generation-source metadata.
 func (s *Store) Wipe(ctx context.Context) error {
+	if s.metadata != nil {
+		if err := s.metadata.invalidate(nil); err != nil {
+			return err
+		}
+	}
 	for _, partition := range s3Partitions() {
 		prefix := path.Join(s.prefix, string(partition)) + "/"
 		if err := s.deleteUnder(ctx, prefix); err != nil {

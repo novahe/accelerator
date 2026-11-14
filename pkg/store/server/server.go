@@ -221,13 +221,16 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	// stream. The client will see io.EOF on its next Send (or it
 	// may have Sent everything already; CloseAndRecv still returns
 	// the response we emit here).
-	exists, err := s.backend.Exists(stream.Context(), generation, partition, key, expectedSize)
+	if partition == store.PartitionChunk {
+		s.stats.chunkPutRequests.Add(1)
+	}
+	exists, cacheHit, err := s.existsWithSource(stream.Context(), generation, partition, key, expectedSize)
 	if err != nil {
 		s.stats.errN.Add(1)
 		return status.Errorf(codes.Internal, "put: exists: %v", err)
 	}
 	if exists {
-		s.stats.putDedup.Add(1)
+		s.recordDedup(partition, cacheHit)
 		return stream.SendAndClose(&pb.PutResponse{IsNew: false})
 	}
 
@@ -313,7 +316,11 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	if isNew {
 		s.stats.putBytes.Add(uint64(nbytes))
 	} else {
-		s.stats.putDedup.Add(1)
+		cacheHit := false
+		if source, ok := handle.(interface{ MetadataCacheHit() bool }); ok {
+			cacheHit = source.MetadataCacheHit()
+		}
+		s.recordDedup(partition, cacheHit)
 	}
 	return stream.SendAndClose(&pb.PutResponse{IsNew: isNew})
 }
@@ -342,5 +349,24 @@ func protoPartitionToStore(p pb.Partition) (store.Partition, error) {
 		return store.PartitionBlob, nil
 	default:
 		return "", errors.New("unknown partition")
+	}
+}
+
+func (s *Server) existsWithSource(ctx context.Context, g store.Generation, p store.Partition, k store.ContentKey, size *int64) (bool, bool, error) {
+	if backend, ok := s.backend.(interface {
+		ExistsWithSource(context.Context, store.Generation, store.Partition, store.ContentKey, *int64) (bool, bool, error)
+	}); ok {
+		return backend.ExistsWithSource(ctx, g, p, k, size)
+	}
+	exists, err := s.backend.Exists(ctx, g, p, k, size)
+	return exists, false, err
+}
+func (s *Server) recordDedup(p store.Partition, fromCache bool) {
+	s.stats.putDedup.Add(1)
+	if p == store.PartitionChunk {
+		s.stats.chunkDedup.Add(1)
+		if fromCache {
+			s.stats.chunkCacheIntercepted.Add(1)
+		}
 	}
 }

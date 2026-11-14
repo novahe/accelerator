@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	storeconfig "github.com/kuasar-sandbox/accelerator/pkg/store/config"
+	stores3 "github.com/kuasar-sandbox/accelerator/pkg/store/s3"
 )
 
 // cmdPurge has two modes:
@@ -58,6 +60,19 @@ func cmdPurge(args []string) {
 		fatal("open object backend: %v", err)
 	}
 	if *all {
+		// Offline wipe must invalidate persistent presence before objects can
+		// disappear, including when this configuration disables the cache.
+		if cfg.Backend == "s3" {
+			dir := storeconfig.DefaultChunkMetadataCacheDir
+			if m := cfg.S3.ChunkMetadataCache; m != nil && m.Dir != "" {
+				dir = m.Dir
+			}
+			release, err := stores3.LockAndClearMetadataCache(dir, cfg.S3CacheNamespace())
+			if err != nil {
+				fatal("clear offline chunk metadata cache: %v", err)
+			}
+			defer release()
+		}
 		if !source.readOnly() {
 			if err := source.remove(ctx); err != nil {
 				fatal("remove generation source: %v", err)

@@ -100,8 +100,9 @@ type generationInput struct {
 	load     func(context.Context) ([]pkgstore.Generation, error)
 	interval time.Duration
 
-	loadMu   sync.Mutex
-	snapshot atomic.Value // immutable []pkgstore.Generation
+	loadMu    sync.Mutex
+	snapshot  atomic.Value                // immutable []pkgstore.Generation
+	onPublish func([]pkgstore.Generation) // internal, installed before run starts
 }
 
 func newGenerationInput(ctx context.Context, source *GenerationSource) (*generationInput, error) {
@@ -142,6 +143,9 @@ func (g *generationInput) refresh(ctx context.Context) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if g.onPublish != nil {
+		g.onPublish(next)
 	}
 	g.snapshot.Store(next)
 	return nil

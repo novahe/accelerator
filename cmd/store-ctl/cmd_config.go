@@ -73,6 +73,10 @@ backend: fs
 # summary (rates, bandwidth, latency p50/p99/max, inflight); idle periods are
 # silent. Default 30s; "0"/"off" disables.
 # stats_interval: 30s
+# S3 defaults: tmpfs JSON counters persist across process restarts.
+# Empty stats_file disables file publication; FS defaults to disabled.
+# stats_file: /run/store-ctl/chunk-metadata-cache-stats.json
+# stats_file_interval: 5s
 
 # Filesystem backend (when backend: fs).
 fs:
@@ -96,6 +100,16 @@ fs:
 #   max_inflight: 64
 #   op_timeout: 10s
 #   max_object_size_bytes: 16777216
+#   # Default ON for S3. Directories are created automatically on tmpfs.
+#   # Unexpired records reload after restart without extending their TTL.
+#   chunk_metadata_cache:
+#     enabled: true
+#     dir: /run/store-ctl/chunk-metadata-cache
+#     max_ttl: 168h
+#     max_entries: 150000
+#     refresh_ahead:
+#       enabled: true
+#       max_qps: 2
 #   tls:
 #     # Extra PEM CA bundle appended to the system trust store — the way
 #     # to trust an endpoint (or intercepting proxy) whose CA is private.
